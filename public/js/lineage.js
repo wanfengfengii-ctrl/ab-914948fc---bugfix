@@ -466,13 +466,15 @@ export function solveLineage(spec) {
       (packAges(ga, t >= 1 ? sizes[t - 1] : 0) << 72n) |
       BigInt((((t * 256 + live) * 256 + gaps) * 8) + (left + 1));
 
+    // 逐边界记录可达状态集合：不应期归因需要回溯到普通断链之前的帧间。
+    const reachByFrame = [];
     let reach = new Map();
     if (viable(0, rootMask, 0, maxSkip)) {
       reach.set(fkey(0, rootMask, 0, maxSkip, rootAge, rootGapAge),
         { live: rootMask, gaps: 0, left: maxSkip, liveAge: rootAge, gapAge: rootGapAge });
     }
+    reachByFrame.push([...reach.values()]);
     let earliest = 0;
-    let blockedStates = [];
     for (let t = 0; t < F - 1; t++) {
       const next = new Map();
       for (const st of reach.values()) {
@@ -489,16 +491,19 @@ export function solveLineage(spec) {
       }
       if (next.size === 0) {
         earliest = t;
-        blockedStates = [...reach.values()];
         break;
       }
       earliest = t + 1;
       reach = next;
+      reachByFrame.push([...reach.values()]);
     }
     earliest = Math.min(earliest, F - 2);
 
-    // 不应期归因：在最早阻断帧间上，若「允许忽略年龄」后存在可达末帧的转移，
-    // 则不可行完全由分裂不应期造成——找出这些转移中被迫过早分裂的母本。
+    // 不应期归因：普通断链（最早无局部可行状态穿过的帧间）可能晚于真正的
+    // 病因——某些保持路径虽能局部延续到更晚的帧间，但所有完整谱系在更早的
+    // 帧间就被迫过早分裂。自前向后找首个「遵守年龄的转移无一能进入（放宽
+    // 年龄的）可行后缀」的边界：该边界上放宽年龄后出现的可行转移，其被迫
+    // 过早分裂的母本即病因；后续帧间的普通断链不得掩盖这一诊断。
     let refractoryBlock = null;
     if (refractoryEnabled) {
       const relMemo = new Map();
@@ -523,37 +528,63 @@ export function solveLineage(spec) {
         return ok;
       }
 
-      // 在放宽可行的转移中统计同一母本出现次数（2 次即分裂），
-      // 选出受阻最严重的过早分裂母本。
-      let bestBlock = null;
-      const betterBlock = (cand, best) =>
-        !best ||
-        cand.need > best.need ||        // 尚缺等待帧间最多（受阻最严重）
-        (cand.need === best.need &&
-          (cand.age < best.age ||       // 分裂年龄最小
-            (cand.age === best.age && cand.mother < best.mother))); // 输入顺序裁决
-      for (const st of blockedStates) {
-        for (const [state, tr] of expand(earliest, st.live, st.gaps, st.liveAge, st.gapAge, true)) {
-          const used = Math.floor(state / 512);
-          const opened = state % 512;
-          const oc = popcnt(opened);
-          if (oc > st.left) continue;
-          if (!canFinishRelaxed(earliest + 1, used, opened, st.left - oc, tr.age, tr.openedAge)) continue;
-
-          const splits = new Map();
-          for (const j of bits(used)) splits.set(tr.mom[j], (splits.get(tr.mom[j]) || 0) + 1);
-          for (const [gm, n] of splits) {
-            if (n !== 2) continue;
-            const { t: mf, i: mi } = decode(gm);
-            if (mf !== earliest) continue; // 只有帧 t 存活母本可能在此边界分裂
-            const age = st.liveAge[mi];
-            if (canSplit(age)) continue;  // 达门槛者不受阻断
-            const block = { frame: earliest, mother: gm, age, need: refractory - age };
-            if (betterBlock(block, bestBlock)) bestBlock = block;
+      // 首个「遵守年龄则无可行后缀」的边界。该边界必然存在且不晚于普通断链
+      // 帧间：那里没有任何可存活的后继，条件自然成立。
+      let blockFrame = -1;
+      for (let t = 0; t <= earliest; t++) {
+        let passable = false;
+        for (const st of reachByFrame[t]) {
+          for (const [state, tr] of expand(t, st.live, st.gaps, st.liveAge, st.gapAge)) {
+            const used = Math.floor(state / 512);
+            const opened = state % 512;
+            const oc = popcnt(opened);
+            if (oc > st.left) continue;
+            if (canFinishRelaxed(t + 1, used, opened, st.left - oc, tr.age, tr.openedAge)) {
+              passable = true;
+              break;
+            }
           }
+          if (passable) break;
+        }
+        if (!passable) {
+          blockFrame = t;
+          break;
         }
       }
-      refractoryBlock = bestBlock;
+
+      // 在阻断边界上放宽年龄的可行转移中统计同一母本出现次数（2 次即分裂），
+      // 选出受阻最严重的过早分裂母本。
+      if (blockFrame >= 0) {
+        let bestBlock = null;
+        const betterBlock = (cand, best) =>
+          !best ||
+          cand.need > best.need ||        // 尚缺等待帧间最多（受阻最严重）
+          (cand.need === best.need &&
+            (cand.age < best.age ||       // 分裂年龄最小
+              (cand.age === best.age && cand.mother < best.mother))); // 输入顺序裁决
+        for (const st of reachByFrame[blockFrame]) {
+          for (const [state, tr] of expand(blockFrame, st.live, st.gaps, st.liveAge, st.gapAge, true)) {
+            const used = Math.floor(state / 512);
+            const opened = state % 512;
+            const oc = popcnt(opened);
+            if (oc > st.left) continue;
+            if (!canFinishRelaxed(blockFrame + 1, used, opened, st.left - oc, tr.age, tr.openedAge)) continue;
+
+            const splits = new Map();
+            for (const j of bits(used)) splits.set(tr.mom[j], (splits.get(tr.mom[j]) || 0) + 1);
+            for (const [gm, n] of splits) {
+              if (n !== 2) continue;
+              const { t: mf, i: mi } = decode(gm);
+              if (mf !== blockFrame) continue; // 只有帧 t 存活母本可能在此边界分裂
+              const age = st.liveAge[mi];
+              if (canSplit(age)) continue;  // 达门槛者不受阻断
+              const block = { frame: blockFrame, mother: gm, age, need: refractory - age };
+              if (betterBlock(block, bestBlock)) bestBlock = block;
+            }
+          }
+        }
+        refractoryBlock = bestBlock;
+      }
     }
 
     return {

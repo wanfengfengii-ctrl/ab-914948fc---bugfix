@@ -2,6 +2,7 @@
 //  1) 等待 /healthz 通过（服务由外部提供 BASE_URL，或本脚本临时拉起一个）；
 //  2) 抓取页面与脚本资源，确认站点可服务；
 //  3) 在同一求解器内核上跑「含一次分裂 + 一次漏检」的谱系场景并校验结果；
+//  4) 分裂不应期场景：跨漏检计龄、连续分裂阻断、普通断链不掩盖更早阻断。
 // 以退出码报告：0 通过，非 0 失败。
 'use strict';
 
@@ -162,6 +163,8 @@ function checkScenario() {
 //     门槛 2 下允许再次分裂；门槛收紧到 3 则被阻断（尚缺 1 帧间）。
 //  B) 连续分裂：末帧需 4 支而两次分裂间隔不足，门槛 2 下不可行并给出阻断母本；
 //     关闭不应期后同一草稿可行。
+//  C) 断链掩盖：保持路径局部延续到末段才断开，但所有完整谱系在更早帧间就被
+//     不应期阻断——阻断归因不得被后续普通断链掩盖；关闭不应期后三支谱系复原。
 function checkRefractoryScenarios() {
   const assert = (cond, msg) => { if (!cond) fail(msg); };
   const s = (id, x, y, b = 40) => ({ id, x, y, b });
@@ -248,6 +251,50 @@ function checkRefractoryScenarios() {
     assert(sol2.divisions === 3 && sol2.spots === undefined,
       '关闭不应期后应允许连续分裂且不携带年龄结果');
     log('不应期场景 B 关闭开关通过：同草稿恢复可行，结果不含年龄字段');
+  }
+
+  // ---- 场景 C：后续普通断链不掩盖更早的不应期阻断 ----
+  // root 首裂为 a、b（龄 0）；第 2→3 帧间 a 必须再裂为 x、y（b 保持到 z）才有
+  // 3 支；第 3→4 帧间 x、y、z 各只有唯一后代，无法增支。保持路径虽能局部延续
+  // 到第 3 帧，但必然失败——阻断必须归因到更早的 第 2→3 帧间的母细胞 a。
+  {
+    const masked = {
+      frames: [
+        [s('root', 0, 0), s('J0', 90, 90, 200)],
+        [s('a', 6, -8), s('b', 6, 8)],
+        [s('x', 12, -12), s('y', 12, -4), s('z', 12, 8)],
+        [s('x1', 18, -14), s('y1', 18, -2), s('z1', 18, 8)],
+      ],
+      startId: 'root', maxDist: 10, maxSkip: 0, target: 3,
+      refractoryEnabled: true, refractory: 2,
+    };
+    const spec = normalizeSpec(masked).spec;
+    const raw = solveLineage(spec);
+    assert(raw.feasible === false, '场景 C 应不可行');
+    assert(raw.earliestBreak.from === 2 && raw.earliestBreak.to === 3,
+      `普通断链应定位在 第 3 帧 → 第 4 帧，实际 ${JSON.stringify(raw.earliestBreak)}`);
+    assert(raw.refractoryBlock && raw.refractoryBlock.frame === 1,
+      `不应期阻断应归因到更早的 第 2→3 帧间: ${JSON.stringify(raw.refractoryBlock)}`);
+    assert(raw.refractoryBlock.age === 0 && raw.refractoryBlock.need === 2,
+      `阻断母本应龄 0、尚缺 2，实际 ${JSON.stringify(raw.refractoryBlock)}`);
+    const sol = presentSolution(spec, raw);
+    assert(sol.refractoryBlock.motherId === 'a',
+      `阻断母本应为 a，实际 ${sol.refractoryBlock.motherId}`);
+    assert(/第 2 帧 → 第 3 帧/.test(sol.refractoryBlock.label) &&
+      /尚缺 2 个等待帧间/.test(sol.refractoryBlock.label),
+      `阻断说明应含帧间与缺口: ${sol.refractoryBlock.label}`);
+    log(`不应期场景 C 通过：普通断链未掩盖更早阻断（${sol.refractoryBlock.label}）`);
+
+    // 关闭不应期：同一草稿恢复可行，a 立即分裂的三支谱系完整到达末帧
+    const freed = { ...masked, refractoryEnabled: false };
+    const sol2 = presentSolution(normalizeSpec(freed).spec,
+      solveLineage(normalizeSpec(freed).spec));
+    assert(sol2.feasible === true && sol2.divisions === 2 && sol2.survivors === 3,
+      '关闭不应期后三支谱系应完整复原');
+    assert(JSON.stringify(sol2.used) ===
+      JSON.stringify([['root'], ['a', 'b'], ['x', 'y', 'z'], ['x1', 'y1', 'z1']]),
+      `三支谱系应为 root→a,b→x,y,z→x1,y1,z1，实际 ${JSON.stringify(sol2.used)}`);
+    log('不应期场景 C 关闭开关通过：a 立即分裂的三支谱系完整到达末帧');
   }
 }
 

@@ -445,6 +445,78 @@ test('跨漏检计龄下门槛 3 时同场景仍被阻断，并报告缺 1 帧�
   assert.match(sol.refractoryBlock.label, /尚缺 1 个等待帧间/);
 });
 
+// 后续普通断链掩盖更早的不应期阻断：root 首裂为 a、b（龄 0）；第 2→3 帧间
+// a 必须再裂为 x、y（b 保持到 z）才有 3 支；第 3→4 帧间 x、y、z 各只有唯一
+// 后代，不存在任何可增支的几何连接。保持路径虽能局部延续到第 3 帧，但必然失败。
+function maskedBlockFrames() {
+  const s = (id, x, y, b = 10) => ({ id, x, y, b });
+  return [
+    [s('root', 0, 0), s('J0', 90, 90, 100)],
+    [s('a', 6, -8), s('b', 6, 8)],
+    [s('x', 12, -12), s('y', 12, -4), s('z', 12, 8)],
+    [s('x1', 18, -14), s('y1', 18, -2), s('z1', 18, 8)],
+  ];
+}
+
+test('后续普通断链不掩盖更早的不应期阻断：阻断归因到 第 2→3 帧间的母细胞 a', () => {
+  const input = {
+    frames: maskedBlockFrames(),
+    startId: 'root', maxDist: 10, maxSkip: 0, target: 3,
+    refractoryEnabled: true, refractory: 2,
+  };
+  const { raw, sol } = run(input);
+  assert.equal(raw.feasible, false);
+  // 普通断链仍在最后一个帧间（保持路径可局部延续到第 3 帧才断开）
+  assert.equal(sol.earliestBreak.from, 2);
+  assert.equal(sol.earliestBreak.to, 3);
+  // 但不应期阻断必须归因到更早的 第 2→3 帧间：母细胞 a、分裂年龄 0、尚缺 2
+  assert.ok(raw.refractoryBlock, '必然失败的保持路径不得掩盖更早的不应期阻断');
+  assert.equal(raw.refractoryBlock.frame, 1);
+  assert.equal(raw.refractoryBlock.age, 0);
+  assert.equal(raw.refractoryBlock.need, 2);
+  assert.equal(sol.refractoryBlock.motherId, 'a');
+  assert.match(sol.refractoryBlock.label, /第 2 帧 → 第 3 帧/);
+  assert.match(sol.refractoryBlock.label, /母细胞 第 2 帧·a/);
+  assert.match(sol.refractoryBlock.label, /分裂年龄仅 0/);
+  assert.match(sol.refractoryBlock.label, /尚缺 2 个等待帧间/);
+});
+
+test('同一场景关闭不应期：a 立即分裂的三支谱系完整到达末帧', () => {
+  const input = {
+    frames: maskedBlockFrames(),
+    startId: 'root', maxDist: 10, maxSkip: 0, target: 3,
+  };
+  const { spec, sol } = run(input);
+  assertValidLineage(spec, sol, input);
+  assert.equal(sol.divisions, 2);
+  assert.deepEqual(sol.used, [['root'], ['a', 'b'], ['x', 'y', 'z'], ['x1', 'y1', 'z1']]);
+});
+
+test('恰好达到门槛即允许分裂：同一几何下女儿保持恰满 2 个帧间后再分裂', () => {
+  const s = (id, x, y, b = 10) => ({ id, x, y, b });
+  const input = {
+    frames: [
+      [s('root', 0, 0), s('J0', 90, 90, 100)],
+      [s('a', 6, -8), s('b', 6, 8)],
+      [s('a2', 12, -8), s('b2', 12, 8)],
+      [s('a3', 18, -8), s('b3', 18, 8)],
+      [s('x', 24, -12), s('y', 24, -4), s('z', 24, 8)],
+      [s('x1', 30, -14), s('y1', 30, -2), s('z1', 30, 8)],
+    ],
+    startId: 'root', maxDist: 10, maxSkip: 0, target: 3,
+    refractoryEnabled: true, refractory: 2,
+  };
+  const { spec, sol } = run(input);
+  assertValidLineage(spec, sol, input);
+  assert.equal(sol.divisions, 2);
+  assert.deepEqual(sol.used,
+    [['root'], ['a', 'b'], ['a2', 'b2'], ['a3', 'b3'], ['x', 'y', 'z'], ['x1', 'y1', 'z1']]);
+  const rec = (t, id) => sol.spots[t].find((r) => r.id === id);
+  assert.equal(rec(3, 'a3').divisionAge, 2); // 分裂时年龄恰为门槛 2
+  assert.equal(rec(4, 'x').age, 0);
+  assert.equal(rec(4, 'x').generation, 2);
+});
+
 test('不应期不改变裁决键：同亮度、同漏检数仍按输入顺序裁决', () => {
   // 两条对称路径，采用更靠输入前面的斑点；门槛放宽到不构成约束。
   const s = (id, x, y, b = 5) => ({ id, x, y, b });

@@ -42,6 +42,6 @@ services:
         node --test test/*.test.mjs
         echo "==> [2/3] 构建（语法检查与资源完整性）"
         node scripts/build.mjs
-        echo "==> [3/3] 谱系烟测（健康检查、静态资源、分裂+漏检、连续分裂阻断、跨漏检计龄）"
+        echo "==> [3/3] 谱系烟测（健康检查、静态资源、分裂+漏检、连续分裂阻断、跨漏检计龄、断链掩盖归因）"
         node scripts/smoke.mjs
         echo "==> verify 全部通过"
