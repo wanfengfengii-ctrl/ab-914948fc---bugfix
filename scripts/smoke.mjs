@@ -162,6 +162,9 @@ function checkScenario() {
 //     门槛 2 下允许再次分裂；门槛收紧到 3 则被阻断（尚缺 1 帧间）。
 //  B) 连续分裂：末帧需 4 支而两次分裂间隔不足，门槛 2 下不可行并给出阻断母本；
 //     关闭不应期后同一草稿可行。
+//  C) 后续普通断链不得掩盖更早的不应期阻断：能局部保持延续的路径不参与归因，
+//     最早阻断按关闭不应期后实际裁决出的完整谱系定位；并核对恰好满龄可分裂、
+//     关闭不应期后完整谱系可复原。
 function checkRefractoryScenarios() {
   const assert = (cond, msg) => { if (!cond) fail(msg); };
   const s = (id, x, y, b = 40) => ({ id, x, y, b });
@@ -251,6 +254,82 @@ function checkRefractoryScenarios() {
   }
 }
 
+// 分裂不应期烟测 C（后续普通断链不得掩盖更早阻断）：
+//  root 首裂 a、b（龄 0）；放宽时 a 在第 2→3 帧间立即裂 x、y，b 接 z；
+//  末帧间三支各只有唯一近邻后代。门槛 2 下完整谱系最早必须在第 2→3 帧间
+//  违反不应期——尽管 a、b 靠保持还能局部延续到第 3 帧。另核对恰好达到门槛
+//  （保持满 2 个帧间再分裂）可行，以及关闭不应期后三支完整谱系可复原。
+function checkRefractoryMaskingScenario() {
+  const assert = (cond, msg) => { if (!cond) fail(msg); };
+  const s = (id, x, y, b = 40) => ({ id, x, y, b });
+  const masking = {
+    frames: [
+      [s('root', 5, 50), s('j0', 90, 90, 200)],
+      [s('a', 13, 55, 42), s('b', 5, 58, 42)],
+      [s('x', 21, 50, 44), s('y', 21, 60, 44), s('z', 5, 66, 44)],
+      [s('x1', 29, 50, 46), s('y1', 29, 60, 46), s('z1', 5, 74, 46), s('j4', 88, 88, 200)],
+    ],
+    startId: 'root', maxDist: 10, maxSkip: 0, target: 3,
+    refractoryEnabled: true, refractory: 2,
+  };
+  {
+    const { errors, spec } = normalizeSpec(masking);
+    if (errors.length) fail(`不应期场景 C 输入校验失败: ${JSON.stringify(errors)}`);
+    const raw = solveLineage(spec);
+    const sol = presentSolution(spec, raw);
+    assert(raw.feasible === false, '门槛 2 下 a 立即再分裂应不可行');
+    assert(raw.earliestBreak.from === 1 && raw.earliestBreak.to === 2,
+      `最早不应期阻断应在第 2→3 帧间，实际 第 ${raw.earliestBreak.from + 1}→${raw.earliestBreak.to + 1} 帧`);
+    assert(raw.refractoryBlock, '必须归因为不应期阻断，而非后续普通断链');
+    assert(raw.refractoryBlock.age === 0 && raw.refractoryBlock.need === 2,
+      `母本应龄 0、尚缺 2，实际 ${JSON.stringify(raw.refractoryBlock)}`);
+    assert(/第 2 帧 → 第 3 帧/.test(sol.refractoryBlock.label) &&
+      /母细胞 第 2 帧·a/.test(sol.refractoryBlock.label) &&
+      /分裂年龄仅 0/.test(sol.refractoryBlock.label) &&
+      /尚缺 2 个等待帧间/.test(sol.refractoryBlock.label),
+      `页面阻断说明应含位置/母本/年龄/缺口: ${sol.refractoryBlock.label}`);
+    log('不应期场景 C 通过：后续普通断链未掩盖第 2→3 帧间母细胞 a 的阻断（尚缺 2 帧间）');
+  }
+  {
+    // 关闭不应期：同一输入三支完整谱系可复原
+    const freed = { ...masking, refractoryEnabled: false };
+    const spec = normalizeSpec(freed).spec;
+    const sol = presentSolution(spec, solveLineage(spec));
+    assert(sol.feasible === true, '关闭不应期后同草稿应可行');
+    assert(sol.divisions === 2 && sol.survivors === 3,
+      `应为首裂 + a 再裂共 2 次、末帧 3 支，实际 divisions=${sol.divisions}`);
+    assert(JSON.stringify(sol.used[3].sort()) === JSON.stringify(['x1', 'y1', 'z1']),
+      `末帧应为 x1/y1/z1，实际 ${JSON.stringify(sol.used[3])}`);
+    assert(sol.spots === undefined, '关闭不应期不应携带年龄结果');
+    log('不应期场景 C 关闭开关通过：三支完整谱系复原（root→a,b；a→x,y；b→z）');
+  }
+  {
+    // 恰好达到门槛：a 沿两个帧间保持（龄 0→1→2）后再分裂，可行
+    const exact = {
+      frames: [
+        [s('root', 5, 50), s('j0', 90, 90, 200)],
+        [s('a', 13, 50, 42), s('b', 5, 58, 42)],
+        [s('a1', 21, 50, 44), s('b1', 5, 66, 44)],
+        [s('a2', 29, 50, 46), s('b2', 5, 74, 46)],
+        [s('p', 37, 50, 48), s('q', 37, 53, 48), s('r', 5, 82, 48), s('j5', 88, 88, 200)],
+      ],
+      startId: 'root', maxDist: 10, maxSkip: 0, target: 3,
+      refractoryEnabled: true, refractory: 2,
+    };
+    const { errors, spec } = normalizeSpec(exact);
+    if (errors.length) fail(`不应期场景 C 满龄输入校验失败: ${JSON.stringify(errors)}`);
+    const raw = solveLineage(spec);
+    if (!raw.feasible) fail(`恰好达到门槛应允许分裂，却判不可行: ${JSON.stringify(raw.earliestBreak)}`);
+    const sol = presentSolution(spec, raw);
+    const a2 = sol.spots[3].find((r) => r.id === 'a2');
+    assert(a2 && a2.age === 2 && a2.divides === true && a2.divisionAge === 2 && a2.wait === 0,
+      `a2 应在分裂年龄恰为 2 时分裂，实际 ${JSON.stringify(a2)}`);
+    assert(JSON.stringify(sol.used[4].sort()) === JSON.stringify(['p', 'q', 'r']),
+      `末帧应为 p/q/r，实际 ${JSON.stringify(sol.used[4])}`);
+    log('不应期场景 C 满龄通过：保持满 2 个帧间（龄恰为门槛）后允许分裂');
+  }
+}
+
 async function main() {
   let base = BASE_URL;
   if (process.env.BASE_URL) {
@@ -269,6 +348,7 @@ async function main() {
   await checkStatic(base);
   checkScenario();
   checkRefractoryScenarios();
+  checkRefractoryMaskingScenario();
   log('全部烟测通过 ✔');
   if (ownServer) ownServer.kill('SIGTERM');
   if (portFile && existsSync(portFile)) rmSync(portFile);

@@ -354,10 +354,16 @@ test('连续分裂被不应期阻断：4 帧内两次分裂在门槛 2 下不可
   };
   const { raw, sol } = run(input);
   assert.equal(raw.feasible, false);
-  assert.equal(raw.earliestBreak.from, 2);
+  // 放宽（关闭不应期）裁决链在第 1→2 帧间即由 b1/b2（龄 0）再次分裂；
+  // 「根保持到第 2 帧再首裂」是只能局部延续、最终必在末帧间失败的路径，
+  // 不得掩盖更早的阻断。
+  assert.equal(raw.earliestBreak.from, 1);
   assert.ok(raw.refractoryBlock, '应给出不应期阻断归因');
+  assert.equal(raw.refractoryBlock.age, 0);
   assert.equal(raw.refractoryBlock.need, 2);
-  assert.match(sol.refractoryBlock.label, /第 3 帧 → 第 4 帧/);
+  assert.equal(sol.refractoryBlock.motherId, 'b1');
+  assert.match(sol.refractoryBlock.label, /第 2 帧 → 第 3 帧/);
+  assert.match(sol.refractoryBlock.label, /母细胞 第 2 帧·b1/);
   assert.match(sol.refractoryBlock.label, /尚缺 2 个等待帧间/);
 });
 
@@ -370,6 +376,78 @@ test('同一输入关闭不应期后可行，且允许连续分裂', () => {
   assertValidLineage(spec, sol, input);
   assert.equal(sol.divisions, 3);
   assert.equal(sol.used[3].length, 4);
+});
+
+test('后续普通断链不得掩盖更早的不应期阻断：报告第 2→3 帧间母细胞 a（龄 0，尚缺 2）', () => {
+  // 四帧：root 首裂 a、b（龄 0）；第 2→3 帧间放宽时 a 立即裂 x、y、b 接 z；
+  // 第 3→4 帧间 x、y、z 各只有唯一后代。启用门槛 2 时完整三支谱系最早必须在
+  // 第 2→3 帧间违反不应期；a、b 虽可保持到第 3 帧，却凑不出末帧 3 支。
+  const s = (id, x, y, b = 10) => ({ id, x, y, b });
+  const input = {
+    frames: [
+      [s('root', 0, 0), s('j0', 90, 90, 99)],
+      [s('a', 8, 0), s('b', 0, 8)],
+      [s('x', 16, 0), s('y', 16, 3), s('z', 0, 16)],
+      [s('x1', 26, 0), s('y1', 26, 3), s('z1', 0, 24), s('j4', 90, 90, 99)],
+    ],
+    startId: 'root', maxDist: 10, maxSkip: 0, target: 3,
+    refractoryEnabled: true, refractory: 2,
+  };
+  const { raw, sol } = run(input);
+  assert.equal(raw.feasible, false);
+  // 阻断位置：第 2 帧 → 第 3 帧（而不是几何上最后才断的第 3 → 4 帧）
+  assert.deepEqual(raw.earliestBreak, { from: 1, to: 2 });
+  assert.match(sol.earliestBreakLabel, /第 2 帧 → 第 3 帧/);
+  assert.ok(raw.refractoryBlock, '必须给出不应期阻断归因，而非普通断链');
+  assert.equal(raw.refractoryBlock.frame, 1);
+  assert.equal(sol.refractoryBlock.motherId, 'a');
+  assert.equal(raw.refractoryBlock.age, 0);
+  assert.equal(raw.refractoryBlock.need, 2);
+  assert.match(sol.refractoryBlock.label, /第 2 帧 → 第 3 帧/);
+  assert.match(sol.refractoryBlock.label, /母细胞 第 2 帧·a/);
+  assert.match(sol.refractoryBlock.label, /分裂年龄仅 0/);
+  assert.match(sol.refractoryBlock.label, /尚缺 2 个等待帧间/);
+});
+
+test('关闭不应期后同一输入完整三支谱系仍可复原', () => {
+  const s = (id, x, y, b = 10) => ({ id, x, y, b });
+  const input = {
+    frames: [
+      [s('root', 0, 0), s('j0', 90, 90, 99)],
+      [s('a', 8, 0), s('b', 0, 8)],
+      [s('x', 16, 0), s('y', 16, 3), s('z', 0, 16)],
+      [s('x1', 26, 0), s('y1', 26, 3), s('z1', 0, 24), s('j4', 90, 90, 99)],
+    ],
+    startId: 'root', maxDist: 10, maxSkip: 0, target: 3,
+  };
+  const { spec, sol } = run(input);
+  assertValidLineage(spec, sol, input);
+  assert.equal(sol.divisions, 2);
+  assert.deepEqual(sol.used, [['root'], ['a', 'b'], ['x', 'y', 'z'], ['x1', 'y1', 'z1']]);
+  assert.equal(sol.spots, undefined, '关闭不应期不输出年龄字段');
+});
+
+test('恰好达到门槛时允许分裂：a 保持两个帧间（龄 2）后分裂，谱系可行', () => {
+  const s = (id, x, y, b = 10) => ({ id, x, y, b });
+  const input = {
+    frames: [
+      [s('root', 0, 0), s('j0', 90, 90, 99)],
+      [s('a', 8, 0), s('b', 0, 8)],
+      [s('a1', 16, 0), s('b1', 0, 16)],
+      [s('a2', 24, 0), s('b2', 0, 24)],
+      [s('p', 32, 0), s('q', 32, 3), s('r', 0, 32), s('j5', 90, 90, 99)],
+    ],
+    startId: 'root', maxDist: 10, maxSkip: 0, target: 3,
+    refractoryEnabled: true, refractory: 2,
+  };
+  const { spec, sol } = run(input);
+  assertValidLineage(spec, sol, input);
+  assert.deepEqual(sol.used[4].sort(), ['p', 'q', 'r']);
+  const a2 = sol.spots[3].find((r0) => r0.id === 'a2');
+  assert.equal(a2.age, 2, 'a2 分裂年龄应恰为门槛 2');
+  assert.equal(a2.divides, true);
+  assert.equal(a2.divisionAge, 2);
+  assert.equal(a2.wait, 0);
 });
 
 test('等待足够帧间后允许分裂：门槛 2 下女儿保持两次再分裂', () => {
@@ -656,4 +734,108 @@ test('随机对拍：小规模输入下与独立暴力枚举裁决一致', () =>
   }
   assert.ok(feasibleCases >= 30, `可行对拍用例过少: ${feasibleCases}`);
   assert.ok(refractoryCases >= 20, `启用不应期的可行对拍用例过少: ${refractoryCases}`);
+});
+
+test('随机对拍：不应期阻断位置/母本/年龄/缺口与关闭不应期后的裁决链一致', () => {
+  const rand = rng(20261003);
+  // 独立依据「关闭不应期解」的边重建分裂年龄，推出首个被迫过早分裂帧间与母本。
+  function expectedBlock(spec, input, offSol) {
+    const F = spec.frames.length;
+    const R = input.refractory;
+    const age = new Map(); // `${frame}:${id}` -> null(起始本体) / number
+    age.set(`0:${input.startId}`, null);
+    const keyOf = (frame, id) => `${frame}:${id}`;
+    let first = null; // {frame, motherId, age, need}
+    for (let b = 0; b < F - 1; b++) {
+      const candidates = [];
+      // 该边界的 gap1 边（保持/分裂）；gap2 捕获不允许分裂
+      const edges1 = offSol.edges.filter((e) => e.gap === 1 && e.fromFrame === b);
+      const byMother = new Map();
+      for (const e of edges1) {
+        if (!byMother.has(e.fromId)) byMother.set(e.fromId, []);
+        byMother.get(e.fromId).push(e);
+      }
+      for (const [mid, es] of byMother) {
+        const motherAge = age.get(keyOf(b, mid));
+        for (const e of es) {
+          age.set(keyOf(e.toFrame, e.toId),
+            es.length === 2 ? 0 : (motherAge === null ? null : motherAge + 1));
+        }
+        if (es.length === 2 && motherAge !== null && motherAge < R) {
+          candidates.push({ frame: b, motherId: mid, age: motherAge, need: R - motherAge });
+        }
+      }
+      // gap2 补获边（母帧 b-1 → 子帧 b+1），年龄 +2；不产生分裂
+      for (const e of offSol.edges.filter((x) => x.gap === 2 && x.fromFrame === b - 1)) {
+        const ma = age.get(keyOf(e.fromFrame, e.fromId));
+        age.set(keyOf(e.toFrame, e.toId), ma === null ? null : ma + 2);
+      }
+      if (candidates.length && !first) {
+        // 与求解器相同的帧内裁决：need 降序 → age 升序 → 母本局部序号升序
+        candidates.sort((p, q) =>
+          q.need - p.need ||
+          p.age - q.age ||
+          spec.frames[b].findIndex((s) => s.id === p.motherId) -
+            spec.frames[b].findIndex((s) => s.id === q.motherId));
+        first = candidates[0];
+      }
+    }
+    return first;
+  }
+
+  let blocked = 0, geometric = 0;
+  for (let iter = 0; iter < 2500; iter++) {
+    const F = rand() < 0.4 ? 5 : 4;
+    const frames = [];
+    for (let t = 0; t < F; t++) {
+      const n = 2 + Math.floor(rand() * 2);
+      const fr = [];
+      for (let i = 0; i < n; i++) {
+        fr.push({
+          id: `g${t}_${i}`,
+          x: Math.floor(rand() * 3),
+          y: Math.floor(rand() * 3),
+          b: Math.floor(rand() * 9) + 1,
+        });
+      }
+      frames.push(fr);
+    }
+    const lastN = frames[F - 1].length;
+    const input = {
+      frames,
+      startId: frames[0][Math.floor(rand() * frames[0].length)].id,
+      maxDist: 1 + Math.floor(rand() * 3),
+      maxSkip: rand() < 0.5 ? 0 : 1,
+      target: 1 + Math.floor(rand() * Math.min(4, lastN)),
+      refractoryEnabled: true,
+      refractory: 2 + Math.floor(rand() * 3),
+    };
+    const { errors, spec } = normalizeSpec(input);
+    if (errors.length) continue;
+    const enRaw = solveLineage(spec);
+    if (enRaw.feasible) continue;
+    const offSpec = normalizeSpec({ ...input, refractoryEnabled: false }).spec;
+    const offRaw = solveLineage(offSpec);
+    if (!offRaw.feasible) {
+      // 放宽后仍无解：纯几何不可行，不应给出不应期归因
+      assert.equal(enRaw.refractoryBlock, null,
+        `迭代 ${iter}：放宽仍无解时不应归因不应期: ${JSON.stringify(enRaw.refractoryBlock)}`);
+      geometric++;
+      continue;
+    }
+    const offSol = presentSolution(offSpec, offRaw);
+    const exp = expectedBlock(spec, input, offSol);
+    assert.ok(exp, `迭代 ${iter}：放宽可行而强制不可行，放宽链必含过早分裂`);
+    assert.ok(enRaw.refractoryBlock, `迭代 ${iter}：缺少不应期阻断归因`);
+    assert.equal(enRaw.earliestBreak.from, exp.frame,
+      `迭代 ${iter}：阻断帧间应为 ${exp.frame}，实际 ${enRaw.earliestBreak.from}`);
+    const gotSol = presentSolution(spec, enRaw);
+    assert.equal(gotSol.refractoryBlock.motherId, exp.motherId,
+      `迭代 ${iter}：阻断母本应为 ${exp.motherId}，实际 ${gotSol.refractoryBlock.motherId}`);
+    assert.equal(enRaw.refractoryBlock.age, exp.age, `迭代 ${iter}：分裂年龄不符`);
+    assert.equal(enRaw.refractoryBlock.need, exp.need, `迭代 ${iter}：缺口帧间不符`);
+    blocked++;
+  }
+  assert.ok(blocked >= 50, `不应期阻断对拍用例过少: ${blocked}`);
+  assert.ok(geometric >= 5, `纯几何不可行对拍用例过少: ${geometric}`);
 });

@@ -357,11 +357,19 @@ export function solveLineage(spec) {
       processed++;
     }
 
+    if (ignoreAge && relaxedBudget) {
+      relaxedBudget.work += dp.size;
+      if (relaxedBudget.work > relaxedBudget.limit) throw relaxedBudget.exhausted;
+    }
     expandMemo.set(key, dp);
     return dp;
   }
 
   const memo = new Map();
+  const memoRelaxed = new Map();
+  // 放宽诊断的工作量预算（累计转移表条目数）：病态全连接输入上单次转移表即可
+  // 爆炸，超预算即放弃不应期归因（非 null 即启用），退回几何断链报告。
+  let relaxedBudget = null;
   // 备忘键含各支年龄：同一边界掩码但年龄分布不同时，可行后缀与最优值均可能不同。
   const stateKey = (t, live, gaps, left, liveAge, gapAge) =>
     (packAges(liveAge, sizes[t]) << 22n) |
@@ -380,61 +388,99 @@ export function solveLineage(spec) {
     return co >= target;
   }
 
-  // 返回从边界 t 到末帧的最优后缀，不可行返回 null
-  function solve(t, live, gaps, left, liveAge, gapAge) {
+  // 返回从边界 t 到末帧的最优后缀，不可行返回 null。
+  // ignoreAge=true 时放宽分裂年龄（仅用于不应期阻断诊断）：展开出的解与正式
+  // 求解共享同一套亮度 / 漏检 / 输入顺序裁决，故诊断所指的正是「关闭不应期后
+  // 实际复原出的那条谱系」。放宽解只需定位链上首个过早分裂，不携带逐帧签名
+  // 数组（平局时沿链逐边界比较即可），以压低二次完整求解的峰值内存。
+  function sigOf(node) {
+    const usedBits = bits(node.pick.used);
+    return { used: usedBits, mothers: usedBits.map((j) => node.pick.mom[j]) };
+  }
+  // 放宽链的输入顺序裁决：与 betterSignature 相同的逐帧字典序，按需沿链比较。
+  function relaxedLess(a, b) {
+    let x = a, y = b;
+    while (x && x.pick && y && y.pick) {
+      const sa = sigOf(x), sb = sigOf(y);
+      const c = compareTuple(sa.used, sb.used);
+      if (c !== 0) return c < 0;
+      const cm = compareTuple(sa.mothers, sb.mothers);
+      if (cm !== 0) return cm < 0;
+      x = x.sub; y = y.sub;
+    }
+    return false;
+  }
+
+  function solve(t, live, gaps, left, liveAge, gapAge, ignoreAge = false) {
+    const memoStore = ignoreAge ? memoRelaxed : memo;
     const key = stateKey(t, live, gaps, left, liveAge, gapAge);
-    if (memo.has(key)) return memo.get(key);
+    if (memoStore.has(key)) return memoStore.get(key);
 
     const count = popcnt(live) + popcnt(gaps);
     if (count > target || left < 0) {
-      memo.set(key, null);
+      memoStore.set(key, null);
       return null;
     }
+    const leaf = { bright: 0, skips: 0, frames: [], pick: null, sub: null };
     if (t === F - 1) {
-      const leaf = gaps === 0 && popcnt(live) === target
-        ? { bright: 0, skips: 0, frames: [], pick: null, sub: null }
-        : null;
-      memo.set(key, leaf);
-      return leaf;
+      memoStore.set(key, gaps === 0 && popcnt(live) === target ? leaf : null);
+      return memoStore.get(key);
     }
     if (!canReachTarget(t, live, gaps)) {
-      memo.set(key, null);
+      memoStore.set(key, null);
       return null;
     }
 
     let best = null;
-    for (const [state, tr] of expand(t, live, gaps, liveAge, gapAge)) {
+    for (const [state, tr] of expand(t, live, gaps, liveAge, gapAge, ignoreAge)) {
       const used = Math.floor(state / 512);
       const opened = state % 512;
       const openCount = popcnt(opened);
       if (openCount > left) continue;
 
-      const sub = solve(t + 1, used, opened, left - openCount, tr.age, tr.openedAge);
+      const sub = solve(t + 1, used, opened, left - openCount, tr.age, tr.openedAge, ignoreAge);
       if (!sub) continue;
 
-      const usedBits = bits(used);
-      const sigFrame = {
-        used: usedBits,
-        mothers: usedBits.map((j) => tr.mom[j]),
-      };
-      const cand = {
-        bright: maskBright[t + 1][used] + sub.bright,
-        skips: openCount + sub.skips,
-        frames: [sigFrame, ...sub.frames],
-        pick: { t, used, mom: tr.mom, age: tr.age, openedAge: tr.openedAge },
-        sub,
-      };
-      if (
-        !best ||
-        cand.bright > best.bright ||
-        (cand.bright === best.bright &&
-          (cand.skips < best.skips ||
-            (cand.skips === best.skips && betterSignature(cand.frames, best.frames))))
-      ) {
-        best = cand;
+      const bright = maskBright[t + 1][used] + sub.bright;
+      const skips = openCount + sub.skips;
+      let take = false;
+      if (ignoreAge) {
+        const pick = { t, used, mom: tr.mom, age: tr.age };
+        if (!best) {
+          take = true;
+        } else if (
+          bright > best.bright ||
+          (bright === best.bright &&
+            (skips < best.skips || (skips === best.skips && relaxedLess({ pick, sub }, best))))
+        ) {
+          take = true;
+        }
+        if (take) best = { bright, skips, pick, sub };
+      } else {
+        const usedBits = bits(used);
+        const sigFrame = {
+          used: usedBits,
+          mothers: usedBits.map((j) => tr.mom[j]),
+        };
+        const cand = {
+          bright,
+          skips,
+          frames: [sigFrame, ...sub.frames],
+          pick: { t, used, mom: tr.mom, age: tr.age, openedAge: tr.openedAge },
+          sub,
+        };
+        if (
+          !best ||
+          cand.bright > best.bright ||
+          (cand.bright === best.bright &&
+            (cand.skips < best.skips ||
+              (cand.skips === best.skips && betterSignature(cand.frames, best.frames))))
+        ) {
+          best = cand;
+        }
       }
     }
-    memo.set(key, best);
+    memoStore.set(key, best);
     return best;
   }
 
@@ -445,9 +491,15 @@ export function solveLineage(spec) {
   const root = solve(0, rootMask, 0, maxSkip, rootAge, rootGapAge);
 
   if (!root) {
-    // 最早断开帧间：逐步前向展开可达状态（含各支分裂年龄），以局部必要存活
-    // 条件（计数走廊、漏检必须在补获帧有可达斑点、末帧计数恰为目标）筛选，
-    // 找出首个所有后继都无法存活的帧间。
+    // 最早阻断帧间诊断分两层：
+    //  1) 逐步前向展开「年龄合法」的可达状态（携带各支分裂年龄），以局部必要
+    //     存活条件（计数走廊、漏检必须在补获帧有可达斑点、末帧计数恰为目标）
+    //     筛选，得到每个帧间边界上的可达状态与首个几何断链帧间；
+    //  2) 启用不应期时，以「忽略年龄」模式按同一套亮度 / 漏检 / 输入顺序裁决
+    //     重新完整求解——其最优谱系正是关闭不应期后页面实际复原出的那条；沿它
+    //     找出第一个被迫过早分裂的帧间。该位置之前一切转移都年龄合法，故是
+    //     所有完整谱系最早必须违反不应期之处；其后靠保持局部延续却必然失败的
+    //     路径不得掩盖这一诊断。
     const viable = (t, live, gaps, left) => {
       if (left < 0) return false;
       if (popcnt(live) + popcnt(gaps) > target) return false;
@@ -466,13 +518,13 @@ export function solveLineage(spec) {
       (packAges(ga, t >= 1 ? sizes[t - 1] : 0) << 72n) |
       BigInt((((t * 256 + live) * 256 + gaps) * 8) + (left + 1));
 
-    let reach = new Map();
+    const reach0 = new Map();
     if (viable(0, rootMask, 0, maxSkip)) {
-      reach.set(fkey(0, rootMask, 0, maxSkip, rootAge, rootGapAge),
+      reach0.set(fkey(0, rootMask, 0, maxSkip, rootAge, rootGapAge),
         { live: rootMask, gaps: 0, left: maxSkip, liveAge: rootAge, gapAge: rootGapAge });
     }
-    let earliest = 0;
-    let blockedStates = [];
+    let reach = reach0;
+    let geomBreak = -1;
     for (let t = 0; t < F - 1; t++) {
       const next = new Map();
       for (const st of reach.values()) {
@@ -488,72 +540,71 @@ export function solveLineage(spec) {
         }
       }
       if (next.size === 0) {
-        earliest = t;
-        blockedStates = [...reach.values()];
+        geomBreak = t;
         break;
       }
-      earliest = t + 1;
       reach = next;
     }
-    earliest = Math.min(earliest, F - 2);
+    const earliestGeom = geomBreak >= 0 ? geomBreak : F - 2;
 
-    // 不应期归因：在最早阻断帧间上，若「允许忽略年龄」后存在可达末帧的转移，
-    // 则不可行完全由分裂不应期造成——找出这些转移中被迫过早分裂的母本。
+    let earliest = earliestGeom;
     let refractoryBlock = null;
     if (refractoryEnabled) {
-      const relMemo = new Map();
-      function canFinishRelaxed(t, live, gaps, left, la, ga) {
-        if (left < 0 || popcnt(live) + popcnt(gaps) > target) return false;
-        if (t === F - 1) return gaps === 0 && popcnt(live) === target;
-        if (!canReachTarget(t, live, gaps)) return false;
-        const k = fkey(t, live, gaps, left, la, ga);
-        if (relMemo.has(k)) return relMemo.get(k);
-        let ok = false;
-        for (const [state, tr] of expand(t, live, gaps, la, ga, true)) {
-          const used = Math.floor(state / 512);
-          const opened = state % 512;
-          const oc = popcnt(opened);
-          if (oc > left) continue;
-          if (canFinishRelaxed(t + 1, used, opened, left - oc, tr.age, tr.openedAge)) {
-            ok = true;
-            break;
-          }
-        }
-        relMemo.set(k, ok);
-        return ok;
+      // 正式解已确认不可行，强制求解备忘（整条谱系链对象）与转移表此后不再
+      // 使用；立即释放，避免与放宽重求（ignoreAge 另占一套转移缓存）叠加抬高
+      // 峰值内存。
+      memo.clear();
+      expandMemo.clear();
+      // 忽略年龄重求；正式解不可行而放宽解可行时，放宽解必含过早分裂。
+      // 工作量预算兜底：超出后放弃不应期归因，仅保留几何断链结论。
+      relaxedBudget = { work: 0, limit: 500000, exhausted: Symbol('relaxed-budget') };
+      let relaxedRoot = null;
+      try {
+        relaxedRoot = solve(0, rootMask, 0, maxSkip, rootAge, rootGapAge, true);
+      } catch (e) {
+        if (e !== relaxedBudget.exhausted) throw e;
+        relaxedRoot = null;
+      } finally {
+        relaxedBudget = null;
       }
+      memoRelaxed.clear();
+      expandMemo.clear();
+      if (relaxedRoot) {
+        // 同一帧间多个被迫过早分裂的母本时，按既有输入顺序稳定裁决：
+        // 尚缺等待帧间最多（受阻最严重）→ 分裂年龄最小 → 母本全局序号最小。
+        let bestBlock = null;
+        const betterBlock = (cand, best) =>
+          !best ||
+          cand.need > best.need ||
+          (cand.need === best.need &&
+            (cand.age < best.age ||
+              (cand.age === best.age && cand.mother < best.mother)));
 
-      // 在放宽可行的转移中统计同一母本出现次数（2 次即分裂），
-      // 选出受阻最严重的过早分裂母本。
-      let bestBlock = null;
-      const betterBlock = (cand, best) =>
-        !best ||
-        cand.need > best.need ||        // 尚缺等待帧间最多（受阻最严重）
-        (cand.need === best.need &&
-          (cand.age < best.age ||       // 分裂年龄最小
-            (cand.age === best.age && cand.mother < best.mother))); // 输入顺序裁决
-      for (const st of blockedStates) {
-        for (const [state, tr] of expand(earliest, st.live, st.gaps, st.liveAge, st.gapAge, true)) {
-          const used = Math.floor(state / 512);
-          const opened = state % 512;
-          const oc = popcnt(opened);
-          if (oc > st.left) continue;
-          if (!canFinishRelaxed(earliest + 1, used, opened, st.left - oc, tr.age, tr.openedAge)) continue;
-
+        // 沿放宽最优链重建各边界存活母本年龄，定位首个含过早分裂的帧间。
+        let liveAgeNow = rootAge;
+        let node = relaxedRoot;
+        while (node && node.pick) {
+          const { t, used, mom, age: childAge } = node.pick;
           const splits = new Map();
-          for (const j of bits(used)) splits.set(tr.mom[j], (splits.get(tr.mom[j]) || 0) + 1);
+          for (const j of bits(used)) splits.set(mom[j], (splits.get(mom[j]) || 0) + 1);
           for (const [gm, n] of splits) {
             if (n !== 2) continue;
             const { t: mf, i: mi } = decode(gm);
-            if (mf !== earliest) continue; // 只有帧 t 存活母本可能在此边界分裂
-            const age = st.liveAge[mi];
-            if (canSplit(age)) continue;  // 达门槛者不受阻断
-            const block = { frame: earliest, mother: gm, age, need: refractory - age };
+            if (mf !== t) continue; // 只有帧 t 存活母本可能在此边界分裂
+            const age = liveAgeNow[mi];
+            if (canSplit(age)) continue; // 达门槛（含起始首裂）者不受阻断
+            const block = { frame: t, mother: gm, age, need: refractory - age };
             if (betterBlock(block, bestBlock)) bestBlock = block;
           }
+          if (bestBlock) {
+            earliest = t;
+            refractoryBlock = bestBlock;
+            break;
+          }
+          liveAgeNow = childAge;
+          node = node.sub;
         }
       }
-      refractoryBlock = bestBlock;
     }
 
     return {
